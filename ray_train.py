@@ -20,6 +20,7 @@ from fairseq.meters import AverageMeter, StopwatchMeter
 
 import ray
 
+
 def main(args, init_distributed=False):
     utils.import_user_module(args)
 
@@ -277,6 +278,7 @@ def get_valid_stats(trainer, args, extra_meters=None):
 
 from contextlib import closing
 import socket
+import os
 
 class RayDistributedActor:
     def run(self, url, world_rank, args):
@@ -298,20 +300,32 @@ class RayDistributedActor:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             return s.getsockname()[1]
 
+
 def ray_main():
     parser = options.get_training_parser()
     args = options.parse_args_and_arch(parser)
 
-    ray.init()
-    Actor = ray.remote(num_cpus=1, num_gpus=int(not args.cpu))(RayDistributedActor)
-    workers = [Actor.remote() for i in range(args.distributed_world_size)]
-    ip = ray.get(workers[0].get_node_ip.remote())
-    port = ray.get(workers[0].find_free_port.remote())
-    address = "tcp://{ip}:{port}".format(ip=ip, port=port)
-    ray.get([
-        worker.run.remote(address, i, args)
-        for i, worker in enumerate(workers) 
-    ])
+    retry = True
+    while retry:
+        ray.init()
+        Actor = ray.remote(num_cpus=1, num_gpus=int(not args.cpu))(RayDistributedActor)
+        workers = [Actor.remote() for i in range(args.distributed_world_size)]
+        ip = ray.get(workers[0].get_node_ip.remote())
+        port = ray.get(workers[0].find_free_port.remote())
+        address = "tcp://{ip}:{port}".format(ip=ip, port=port)
+        finished, unfinished = ray.wait([
+            worker.run.remote(address, i, args)
+            for i, worker in enumerate(workers)
+        ])
+        try:
+            objs = ray.get(finished)
+            retry = False
+        except Exception as inst:
+            print("Ray restart because following error occurs:")
+            print(inst)
+            retry = True
+        ray.shutdown()
+
 
 if __name__ == '__main__':
     ray_main()
