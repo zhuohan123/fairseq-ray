@@ -332,6 +332,8 @@ def add_distributed_training_args(parser):
     group.add_argument('--find-unused-parameters', default=False, action='store_true',
                        help='disable unused parameter detection (not applicable to '
                        'no_c10d ddp-backend')
+    group.add_argument('--redis-address', default=None, type=str,
+                       help='redis address for ray initialization')
     # fmt: on
     return group
 

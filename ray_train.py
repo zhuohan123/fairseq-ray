@@ -307,7 +307,7 @@ def ray_main():
 
     retry = True
     while retry:
-        ray.init()
+        ray.init(redis_address=args.redis_address)
         Actor = ray.remote(num_cpus=1, num_gpus=int(not args.cpu))(RayDistributedActor)
         workers = [Actor.remote() for i in range(args.distributed_world_size)]
         ip = ray.get(workers[0].get_node_ip.remote())
