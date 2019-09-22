@@ -48,7 +48,6 @@ def main(args, init_distributed=False):
 
     if distributed_utils.is_master(args):
         checkpoint_utils.verify_checkpoint_directory(args.save_dir)
-        check_new_resources_availability(args)
 
     # Print args
     print(args)
@@ -163,6 +162,7 @@ def train(args, trainer, task, epoch_itr):
         ):
             valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets)
             checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
+            check_new_resources_availability(args)
 
         if num_updates >= max_update:
             break
@@ -180,6 +180,7 @@ def train(args, trainer, task, epoch_itr):
         meter = trainer.get_meter(k)
         if meter is not None:
             meter.reset()
+
 
 class RayDistributedActor:
     def run(self, url, world_rank, args):
