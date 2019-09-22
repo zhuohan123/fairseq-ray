@@ -17,8 +17,15 @@ from fairseq import checkpoint_utils, distributed_utils, options, progress_bar, 
 from fairseq.data import iterators
 from fairseq.trainer import Trainer
 from fairseq.meters import AverageMeter, StopwatchMeter
-
+from fairseq_cli.train import validate, get_training_stats
 import ray
+import copy
+
+def check_new_gpu_availability(args):
+    cluster_resources = ray.cluster_resources()
+    n_gpus = int(cluster_resources["GPU"])
+    if n_gpus > args.distributed_world_size:
+        raise Exception("New GPUs find (original %d GPUs, now %d GPUs)" % (args.distributed_world_size, n_gpus))
 
 
 def main(args, init_distributed=False):
@@ -33,6 +40,7 @@ def main(args, init_distributed=False):
 
     if distributed_utils.is_master(args):
         checkpoint_utils.verify_checkpoint_directory(args.save_dir)
+        check_new_gpu_availability(args)
 
     # Print args
     print(args)
@@ -89,6 +97,7 @@ def main(args, init_distributed=False):
         # save checkpoint
         if epoch_itr.epoch % args.save_interval == 0:
             checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
+            check_new_gpu_availability(args)
 
         if ':' in getattr(args, 'data', ''):
             # sharded data: get train iterator for next epoch
@@ -165,120 +174,8 @@ def train(args, trainer, task, epoch_itr):
             meter.reset()
 
 
-def get_training_stats(trainer):
-    stats = collections.OrderedDict()
-    stats['loss'] = trainer.get_meter('train_loss')
-    if trainer.get_meter('train_nll_loss').count > 0:
-        nll_loss = trainer.get_meter('train_nll_loss')
-        stats['nll_loss'] = nll_loss
-    else:
-        nll_loss = trainer.get_meter('train_loss')
-    stats['ppl'] = utils.get_perplexity(nll_loss.avg)
-    stats['wps'] = trainer.get_meter('wps')
-    stats['ups'] = trainer.get_meter('ups')
-    stats['wpb'] = trainer.get_meter('wpb')
-    stats['bsz'] = trainer.get_meter('bsz')
-    stats['num_updates'] = trainer.get_num_updates()
-    stats['lr'] = trainer.get_lr()
-    stats['gnorm'] = trainer.get_meter('gnorm')
-    stats['clip'] = trainer.get_meter('clip')
-    stats['oom'] = trainer.get_meter('oom')
-    if trainer.get_meter('loss_scale') is not None:
-        stats['loss_scale'] = trainer.get_meter('loss_scale')
-    stats['wall'] = round(trainer.get_meter('wall').elapsed_time)
-    stats['train_wall'] = trainer.get_meter('train_wall')
-    return stats
-
-
-def validate(args, trainer, task, epoch_itr, subsets):
-    """Evaluate the model on the validation set(s) and return the losses."""
-    valid_losses = []
-    for subset in subsets:
-        # Initialize data iterator
-        itr = task.get_batch_iterator(
-            dataset=task.dataset(subset),
-            max_tokens=args.max_tokens_valid,
-            max_sentences=args.max_sentences_valid,
-            max_positions=utils.resolve_max_positions(
-                task.max_positions(),
-                trainer.get_model().max_positions(),
-            ),
-            ignore_invalid_inputs=args.skip_invalid_size_inputs_valid_test,
-            required_batch_size_multiple=args.required_batch_size_multiple,
-            seed=args.seed,
-            num_shards=args.distributed_world_size,
-            shard_id=args.distributed_rank,
-            num_workers=args.num_workers,
-        ).next_epoch_itr(shuffle=False)
-        progress = progress_bar.build_progress_bar(
-            args, itr, epoch_itr.epoch,
-            prefix='valid on \'{}\' subset'.format(subset),
-            no_progress_bar='simple'
-        )
-
-        # reset validation loss meters
-        for k in ['valid_loss', 'valid_nll_loss']:
-            meter = trainer.get_meter(k)
-            if meter is not None:
-                meter.reset()
-        extra_meters = collections.defaultdict(lambda: AverageMeter())
-
-        for sample in progress:
-            log_output = trainer.valid_step(sample)
-
-            for k, v in log_output.items():
-                if k in ['loss', 'nll_loss', 'ntokens', 'nsentences', 'sample_size']:
-                    continue
-                extra_meters[k].update(v)
-
-        # log validation stats
-        stats = get_valid_stats(trainer, args, extra_meters)
-        for k, meter in extra_meters.items():
-            stats[k] = meter.avg
-        progress.print(stats, tag=subset, step=trainer.get_num_updates())
-
-        valid_losses.append(
-            stats[args.best_checkpoint_metric].avg
-            if args.best_checkpoint_metric == 'loss'
-            else stats[args.best_checkpoint_metric]
-        )
-    return valid_losses
-
-
-def get_valid_stats(trainer, args, extra_meters=None):
-    stats = collections.OrderedDict()
-    stats['loss'] = trainer.get_meter('valid_loss')
-    if trainer.get_meter('valid_nll_loss').count > 0:
-        nll_loss = trainer.get_meter('valid_nll_loss')
-        stats['nll_loss'] = nll_loss
-    else:
-        nll_loss = stats['loss']
-    stats['ppl'] = utils.get_perplexity(nll_loss.avg)
-    stats['num_updates'] = trainer.get_num_updates()
-    if hasattr(checkpoint_utils.save_checkpoint, 'best'):
-        key = 'best_{0}'.format(args.best_checkpoint_metric)
-        best_function = max if args.maximize_best_checkpoint_metric else min
-
-        current_metric = None
-        if args.best_checkpoint_metric == 'loss':
-            current_metric = stats['loss'].avg
-        elif args.best_checkpoint_metric in extra_meters:
-            current_metric = extra_meters[args.best_checkpoint_metric].avg
-        elif args.best_checkpoint_metric in stats:
-            current_metric = stats[args.best_checkpoint_metric]
-        else:
-            raise ValueError("best_checkpoint_metric not found in logs")
-
-        stats[key] = best_function(
-            checkpoint_utils.save_checkpoint.best,
-            current_metric,
-        )
-    return stats
-
-
 from contextlib import closing
 import socket
-import os
 
 class RayDistributedActor:
     def run(self, url, world_rank, args):
@@ -287,7 +184,7 @@ class RayDistributedActor:
         self.world_rank = world_rank
         args.distributed_rank = world_rank
         args.distributed_init_method = url
-        main(args, init_distributed=True)
+        main(args, init_distributed=(args.distributed_world_size > 1))
 
     def get_node_ip(self):
         """Returns the IP address of the current node."""
@@ -301,12 +198,23 @@ class RayDistributedActor:
             return s.getsockname()[1]
 
 
+def add_ray_args(parser):
+    group = parser.add_argument_group('Ray related arguments')
+    # fmt: off
+    group.add_argument('--redis-address', default=None, type=str,
+                       help='redis address for ray initialization')
+    # fmt: on
+    return group
+
+
 def ray_main():
     parser = options.get_training_parser()
+    add_ray_args(parser)
     args = options.parse_args_and_arch(parser)
-
+    original_args = copy.deepcopy(args)
     retry = True
     while retry:
+        args = copy.deepcopy(original_args)
         ray.init(redis_address=args.redis_address)
         cluster_resources = ray.cluster_resources()
         args.distributed_world_size = int(cluster_resources["GPU"])
@@ -315,12 +223,11 @@ def ray_main():
         ip = ray.get(workers[0].get_node_ip.remote())
         port = ray.get(workers[0].find_free_port.remote())
         address = "tcp://{ip}:{port}".format(ip=ip, port=port)
-        finished, unfinished = ray.wait([
-            worker.run.remote(address, i, args)
-            for i, worker in enumerate(workers)
-        ])
+        unfinished = [worker.run.remote(address, i, args)for i, worker in enumerate(workers)]
         try:
-            objs = ray.get(finished)
+            while len(unfinished) > 0:
+                finished, unfinished = ray.wait(unfinished)
+                finished = ray.get(finished)
             retry = False
         except Exception as inst:
             print("Ray restart because following error occurs:")
