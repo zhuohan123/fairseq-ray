@@ -18,14 +18,22 @@ from fairseq.data import iterators
 from fairseq.trainer import Trainer
 from fairseq.meters import AverageMeter, StopwatchMeter
 from fairseq_cli.train import validate, get_training_stats
+from contextlib import closing
 import ray
 import copy
+import socket
+import time
 
-def check_new_gpu_availability(args):
+def check_new_resources_availability(args):
     cluster_resources = ray.cluster_resources()
-    n_gpus = int(cluster_resources["GPU"])
-    if n_gpus > args.distributed_world_size:
-        raise Exception("New GPUs find (original %d GPUs, now %d GPUs)" % (args.distributed_world_size, n_gpus))
+    if args.cpu:
+        n_cpus = int(cluster_resources["CPU"])
+        if n_cpus > args.distributed_world_size:
+            raise Exception("New CPUs find (original %d CPUs, now %d CPUs)" % (args.distributed_world_size, n_cpus))
+    else:
+        n_gpus = int(getattr(cluster_resources, "GPU", 0))
+        if n_gpus > args.distributed_world_size:
+            raise Exception("New GPUs find (original %d GPUs, now %d GPUs)" % (args.distributed_world_size, n_gpus))
 
 
 def main(args, init_distributed=False):
@@ -40,7 +48,7 @@ def main(args, init_distributed=False):
 
     if distributed_utils.is_master(args):
         checkpoint_utils.verify_checkpoint_directory(args.save_dir)
-        check_new_gpu_availability(args)
+        check_new_resources_availability(args)
 
     # Print args
     print(args)
@@ -97,7 +105,7 @@ def main(args, init_distributed=False):
         # save checkpoint
         if epoch_itr.epoch % args.save_interval == 0:
             checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
-            check_new_gpu_availability(args)
+            check_new_resources_availability(args)
 
         if ':' in getattr(args, 'data', ''):
             # sharded data: get train iterator for next epoch
@@ -173,10 +181,6 @@ def train(args, trainer, task, epoch_itr):
         if meter is not None:
             meter.reset()
 
-
-from contextlib import closing
-import socket
-
 class RayDistributedActor:
     def run(self, url, world_rank, args):
         print("Ray worker at {url} rank {rank}".format(url=url, rank=world_rank))
@@ -217,6 +221,14 @@ def ray_main():
         args = copy.deepcopy(original_args)
         ray.init(redis_address=args.redis_address)
         cluster_resources = ray.cluster_resources()
+        if args.cpu:
+            args.distributed_world_size = int(cluster_resources["CPU"])
+        else:
+            n_gpus = int(getattr(cluster_resources, "GPU", 0))
+            while n_gpus == 0:
+                print("No GPUs available, wait 10 seconds")
+                time.sleep(10)
+            args.distributed_world_size = n_gpus
         args.distributed_world_size = int(cluster_resources["GPU"])
         Actor = ray.remote(num_cpus=1, num_gpus=int(not args.cpu))(RayDistributedActor)
         workers = [Actor.remote() for i in range(args.distributed_world_size)]
