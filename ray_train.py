@@ -206,8 +206,8 @@ class RayDistributedActor:
 def add_ray_args(parser):
     group = parser.add_argument_group('Ray related arguments')
     # fmt: off
-    group.add_argument('--redis-address', default=None, type=str,
-                       help='redis address for ray initialization')
+    group.add_argument('--ray-address', default="auto", type=str,
+                       help='address for ray initialization')
     # fmt: on
     return group
 
@@ -220,7 +220,7 @@ def ray_main():
     retry = True
     while retry:
         args = copy.deepcopy(original_args)
-        ray.init(redis_address=args.redis_address)
+        ray.init(address=args.ray_address)
         if args.cpu:
             args.distributed_world_size = int(ray.cluster_resources()["CPU"])
         else:
