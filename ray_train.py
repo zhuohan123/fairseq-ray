@@ -24,14 +24,14 @@ import copy
 import socket
 import time
 
+
 def check_new_resources_availability(args):
-    cluster_resources = ray.cluster_resources()
     if args.cpu:
-        n_cpus = int(cluster_resources["CPU"])
+        n_cpus = int(ray.cluster_resources()["CPU"])
         if n_cpus > args.distributed_world_size:
             raise Exception("New CPUs find (original %d CPUs, now %d CPUs)" % (args.distributed_world_size, n_cpus))
     else:
-        n_gpus = int(getattr(cluster_resources, "GPU", 0))
+        n_gpus = int(ray.cluster_resources().get("GPU", 0))
         if n_gpus > args.distributed_world_size:
             raise Exception("New GPUs find (original %d GPUs, now %d GPUs)" % (args.distributed_world_size, n_gpus))
 
@@ -223,11 +223,11 @@ def ray_main():
         if args.cpu:
             args.distributed_world_size = int(ray.cluster_resources()["CPU"])
         else:
-            n_gpus = int(getattr(ray.cluster_resources(), "GPU", 0))
+            n_gpus = int(ray.cluster_resources().get("GPU", 0))
             while n_gpus == 0:
                 print("No GPUs available, wait 10 seconds")
                 time.sleep(10)
-                n_gpus = int(getattr(ray.cluster_resources(), "GPU", 0))
+                n_gpus = int(ray.cluster_resources().get("GPU", 0))
             args.distributed_world_size = n_gpus
         Actor = ray.remote(num_cpus=1, num_gpus=int(not args.cpu))(RayDistributedActor)
         workers = [Actor.remote() for i in range(args.distributed_world_size)]
