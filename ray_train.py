@@ -220,16 +220,15 @@ def ray_main():
     while retry:
         args = copy.deepcopy(original_args)
         ray.init(redis_address=args.redis_address)
-        cluster_resources = ray.cluster_resources()
         if args.cpu:
-            args.distributed_world_size = int(cluster_resources["CPU"])
+            args.distributed_world_size = int(ray.cluster_resources()["CPU"])
         else:
-            n_gpus = int(getattr(cluster_resources, "GPU", 0))
+            n_gpus = int(getattr(ray.cluster_resources(), "GPU", 0))
             while n_gpus == 0:
                 print("No GPUs available, wait 10 seconds")
                 time.sleep(10)
+                n_gpus = int(getattr(ray.cluster_resources(), "GPU", 0))
             args.distributed_world_size = n_gpus
-        args.distributed_world_size = int(cluster_resources["GPU"])
         Actor = ray.remote(num_cpus=1, num_gpus=int(not args.cpu))(RayDistributedActor)
         workers = [Actor.remote() for i in range(args.distributed_world_size)]
         ip = ray.get(workers[0].get_node_ip.remote())
