@@ -10,7 +10,11 @@ Train a new model on one or across multiple GPUs.
 import collections
 import math
 import random
+import copy
+import socket
+import time
 
+import ray
 import torch
 
 from fairseq import checkpoint_utils, distributed_utils, options, progress_bar, tasks, utils
@@ -19,10 +23,6 @@ from fairseq.trainer import Trainer
 from fairseq.meters import AverageMeter, StopwatchMeter
 from fairseq_cli.train import validate, get_training_stats
 from contextlib import closing
-import ray
-import copy
-import socket
-import time
 
 
 def check_new_resources_availability(args):
@@ -208,6 +208,9 @@ def add_ray_args(parser):
     # fmt: off
     group.add_argument('--ray-address', default="auto", type=str,
                        help='address for ray initialization')
+    group.add_argument('--fix-batch-size', default=None, type=int,
+                       help='fix batch size (max_sentences * update_freq * n_GPUs) to be '
+                            'a fixed input value for different number of GPUs or CPUs')
     # fmt: on
     return group
 
@@ -230,6 +233,10 @@ def ray_main():
                 time.sleep(10)
                 n_gpus = int(ray.cluster_resources().get("GPU", 0))
             args.distributed_world_size = n_gpus
+        if args.fix_batch_size is not None:
+            args.update_freq = math.ceil(args.fix_batch_size / (args.max_sentences * args.distributed_world_size))
+            print("Training on %d GPUs, max_sentences=%d, update_freq=%d"
+                  % (args.distributed_world_size, args.max_sentences, args.fix_batch_size))
         Actor = ray.remote(num_cpus=1, num_gpus=int(not args.cpu))(RayDistributedActor)
         workers = [Actor.remote() for i in range(args.distributed_world_size)]
         ip = ray.get(workers[0].get_node_ip.remote())
