@@ -1,37 +1,41 @@
 #!/usr/bin/env python3 -u
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-"""
-Train a new model on one or across multiple GPUs.
-"""
 
-import collections
 import math
 import copy
 import socket
 import time
 
 import ray
-import torch
 
 import fairseq
-from fairseq import checkpoint_utils, options
+from fairseq import options
 from fairseq_cli.train import main
 from contextlib import closing
 
-_original_save_checkpoint = checkpoint_utils.save_checkpoint
+_original_save_checkpoint = fairseq.checkpoint_utils.save_checkpoint
 
 
 class RayDistributedActor:
+    """
+    Ray distributed actor to perform distributed training.
+    """
     def run(self, url, world_rank, args):
+        """
+        Set different fields in args for different ray actor processes, add a
+        checkpoint hook, and call the main function of fairseq.
+        """
+
+        # Set the init_method and rank of the process for distributed training.
         print("Ray worker at {url} rank {rank}".format(url=url, rank=world_rank))
         self.url = url
         self.world_rank = world_rank
         args.distributed_rank = world_rank
         args.distributed_init_method = url
 
+        # Add a hook to the original save_checkpoint function to check whether
+        # or not there is new computational resources available. If so, raise
+        # an exception to restart the training process and make use of the new
+        # resources.
         if args.cpu:
             original_n_cpus = args.distributed_world_size
 
@@ -52,6 +56,7 @@ class RayDistributedActor:
                                     % (original_n_gpus, n_gpus))
         fairseq.checkpoint_utils.save_checkpoint = _new_save_checkpoint
 
+        # Call the original main function of fairseq.
         main(args, init_distributed=(args.distributed_world_size > 1))
 
     def get_node_ip(self):
@@ -67,6 +72,7 @@ class RayDistributedActor:
 
 
 def add_ray_args(parser):
+    """Add ray and fault-tolerance related parser arguments to the parser."""
     group = parser.add_argument_group('Ray related arguments')
     # fmt: off
     group.add_argument('--ray-address', default="auto", type=str,
@@ -80,14 +86,23 @@ def add_ray_args(parser):
 
 
 def ray_main():
+    """Entrance function to the fairseq library, providing fault-tolerance."""
+
+    # Parse the command line arguments.
     parser = options.get_training_parser()
     add_ray_args(parser)
     args = options.parse_args_and_arch(parser)
     original_args = copy.deepcopy(args)
+
+    # Main loop for fault-tolerant training.
     retry = True
     while retry:
         args = copy.deepcopy(original_args)
+
+        # Initialize Ray.
         ray.init(address=args.ray_address)
+
+        # Get the number of resources and set the corresponding fields.
         if args.cpu:
             args.distributed_world_size = int(ray.cluster_resources()["CPU"])
         else:
@@ -97,6 +112,9 @@ def ray_main():
                 time.sleep(10)
                 n_gpus = int(ray.cluster_resources().get("GPU", 0))
             args.distributed_world_size = n_gpus
+
+        # Set the total batch_size to a fixed number no matter how many GPUs we
+        # will use.
         if args.fix_batch_size is not None:
             args.update_freq = math.ceil(
                 args.fix_batch_size / (args.max_sentences *
@@ -104,12 +122,20 @@ def ray_main():
             print("Training on %d GPUs, max_sentences=%d, update_freq=%d"
                   % (args.distributed_world_size, args.max_sentences,
                      args.fix_batch_size))
+
+        # Set up Ray distributed actors.
         Actor = ray.remote(
             num_cpus=1, num_gpus=int(not args.cpu))(RayDistributedActor)
         workers = [Actor.remote() for i in range(args.distributed_world_size)]
+
+        # Get the IP address and a free port of actor 0, which is used for
+        # fairseq distributed training.
         ip = ray.get(workers[0].get_node_ip.remote())
         port = ray.get(workers[0].find_free_port.remote())
         address = "tcp://{ip}:{port}".format(ip=ip, port=port)
+
+        # Start the remote processes, and check whether their are any process
+        # fails. If so, restart all the processes.
         unfinished = [worker.run.remote(address, i, args)
                       for i, worker in enumerate(workers)]
         try:
